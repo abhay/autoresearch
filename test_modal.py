@@ -14,6 +14,7 @@ app = modal.App("autoresearch-test")
 # Only copy the files needed to build and run
 _PROJECT_FILES = [
     "backend.py",
+    "config.py",
     "prepare.py",
     "train.py",
     "pyproject.toml",
