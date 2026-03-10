@@ -1,12 +1,16 @@
 """
 Autoresearch MLX training script. Native Apple Silicon training.
 Usage: uv run python train_mlx.py
+
+All hyperparameters can be overridden via AR_* env vars (for sweep.py).
 """
 
 import os
 import gc
+import sys
 import time
 import math
+from functools import partial
 from dataclasses import asdict
 
 import numpy as np
@@ -14,22 +18,65 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
-from config import (
-    GPTConfig, TOTAL_BATCH_SIZE, EMBEDDING_LR, UNEMBEDDING_LR, MATRIX_LR,
-    SCALAR_LR, WEIGHT_DECAY, ADAM_BETAS, DEPTH,
-    build_model_config, get_lr_multiplier, get_muon_momentum, get_weight_decay,
-)
+from config import GPTConfig, get_muon_momentum
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, TOKENIZER_DIR, _document_batches
 
 # ---------------------------------------------------------------------------
-# Apple Silicon overrides
+# Apple Silicon hyperparameters (env var overrides for sweep.py)
 # ---------------------------------------------------------------------------
 
-DEVICE_BATCH_SIZE = 16
-EVAL_TOKENS = 3 * 524288  # smaller eval for faster iteration
+# Model architecture
+DEPTH = int(os.environ.get("AR_DEPTH", 4))
+ASPECT_RATIO = int(os.environ.get("AR_ASPECT_RATIO", 48))
+HEAD_DIM = 128
+WINDOW_PATTERN = os.environ.get("AR_WINDOW_PATTERN", "L")
 
-# Conservative peak FLOPS for MFU (bf16). Override for your chip.
-PEAK_FLOPS = 14.0e12
+# Optimization (tuned via sweep.py on Apple Silicon)
+TOTAL_BATCH_SIZE = int(os.environ.get("AR_TOTAL_BATCH_SIZE", 2**16))
+DEVICE_BATCH_SIZE = int(os.environ.get("AR_DEVICE_BATCH_SIZE", 16))
+EMBEDDING_LR = float(os.environ.get("AR_EMBEDDING_LR", 0.6))
+UNEMBEDDING_LR = float(os.environ.get("AR_UNEMBEDDING_LR", 0.008))
+MATRIX_LR = float(os.environ.get("AR_MATRIX_LR", 0.12))
+SCALAR_LR = float(os.environ.get("AR_SCALAR_LR", 0.5))
+WEIGHT_DECAY = float(os.environ.get("AR_WEIGHT_DECAY", 0.2))
+ADAM_BETAS = (float(os.environ.get("AR_ADAM_BETA1", 0.8)), float(os.environ.get("AR_ADAM_BETA2", 0.95)))
+WARMUP_RATIO = float(os.environ.get("AR_WARMUP_RATIO", 0.0))
+WARMDOWN_RATIO = float(os.environ.get("AR_WARMDOWN_RATIO", 0.5))
+FINAL_LR_FRAC = float(os.environ.get("AR_FINAL_LR_FRAC", 0.0))
+NS_STEPS = int(os.environ.get("AR_NS_STEPS", 5))
+
+# Eval
+EVAL_TOKENS = 3 * 524288
+FINAL_EVAL_BATCH_SIZE = int(os.environ.get("AR_FINAL_EVAL_BATCH_SIZE", 64))
+
+# Hardware
+PEAK_FLOPS = 14.0e12  # conservative bf16 peak for M-series MFU calculation
+
+# ---------------------------------------------------------------------------
+# Local config builders & schedules (use local hyperparams, not config.py's)
+# ---------------------------------------------------------------------------
+
+def build_model_config(depth, vocab_size, sequence_len):
+    base_dim = depth * ASPECT_RATIO
+    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
+    num_heads = model_dim // HEAD_DIM
+    return GPTConfig(
+        sequence_len=sequence_len, vocab_size=vocab_size,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        window_pattern=WINDOW_PATTERN,
+    )
+
+def get_lr_multiplier(progress):
+    if progress < WARMUP_RATIO:
+        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+    elif progress < 1.0 - WARMDOWN_RATIO:
+        return 1.0
+    else:
+        cooldown = (1.0 - progress) / WARMDOWN_RATIO
+        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+
+def get_weight_decay(progress):
+    return WEIGHT_DECAY * (1 - progress)
 
 # ---------------------------------------------------------------------------
 # Attention masks
@@ -103,13 +150,17 @@ def evaluate_bpb(model, tokenizer, batch_size):
         tb = torch.load(os.path.join(TOKENIZER_DIR, "token_bytes.pt"), map_location="cpu")
         _token_bytes = mx.array(tb.numpy())
 
+    @partial(mx.compile, inputs=[model.state])
+    def eval_forward(x):
+        return model(x)
+
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
-    for _ in range(steps):
+    for i in range(steps):
         x, y, _ = next(val_loader)
-        logits = model(x)
+        logits = eval_forward(x)
         loss = nn.losses.cross_entropy(logits, y, reduction="none").reshape(-1)
         y_flat = y.reshape(-1)
         nbytes = _token_bytes[y_flat]
@@ -119,6 +170,10 @@ def evaluate_bpb(model, tokenizer, batch_size):
         mx.eval(sn, sb)
         total_nats += sn.item()
         total_bytes += sb.item()
+        if (i + 1) % 10 == 0:
+            print(f"\rEval: {i+1}/{steps} steps", end="", flush=True)
+    if steps >= 10:
+        print()
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
@@ -412,20 +467,21 @@ class MuonAdamW:
             s["mom"] = momentum * s["mom"] + (1 - momentum) * stacked_g
             ng = (1 - momentum) * stacked_g + momentum * s["mom"]
 
-            # Polar Express orthogonalization (float32 — Metal bfloat16 matmul lacks float32 accumulation)
-            X = ng.astype(mx.float32)
-            X = X / (mx.sqrt(mx.sum(X * X, axis=(-2, -1), keepdims=True)) * 1.02 + 1e-6)
+            # Polar Express orthogonalization (mixed precision — bf16 matmuls, f32 coefficients)
+            X = ng.astype(mx.bfloat16)
+            X_norm = mx.sqrt((X.astype(mx.float32) ** 2).sum(axis=(-2, -1), keepdims=True))
+            X = X / (X_norm * 1.02 + 1e-6).astype(mx.bfloat16)
             ndim = X.ndim
             swap = list(range(ndim - 2)) + [ndim - 1, ndim - 2]
             if shape[-2] > shape[-1]:
                 for a, b, c in polar_express_coeffs[:ns_steps]:
-                    A = mx.transpose(X, swap) @ X
-                    B_mat = b * A + c * (A @ A)
+                    A = (mx.transpose(X, swap) @ X).astype(mx.float32)
+                    B_mat = (b * A + c * (A @ A)).astype(mx.bfloat16)
                     X = a * X + X @ B_mat
             else:
                 for a, b, c in polar_express_coeffs[:ns_steps]:
-                    A = X @ mx.transpose(X, swap)
-                    B_mat = b * A + c * (A @ A)
+                    A = (X @ mx.transpose(X, swap)).astype(mx.float32)
+                    B_mat = (b * A + c * (A @ A)).astype(mx.bfloat16)
                     X = a * X + B_mat @ X
             ng = X
 
@@ -453,6 +509,11 @@ class MuonAdamW:
 
 t_start = time.time()
 mx.random.seed(42)
+
+# Optional memory limit for smaller machines (e.g., AR_MEMORY_LIMIT_GB=14)
+_mem_limit_gb = os.environ.get("AR_MEMORY_LIMIT_GB")
+if _mem_limit_gb:
+    mx.metal.set_memory_limit(int(float(_mem_limit_gb) * 1024 * 1024 * 1024))
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -490,14 +551,18 @@ optimizer = MuonAdamW([
     dict(kind="adamw", filter=lambda p, v: "x0_lambdas" in p,
          lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
     dict(kind="muon", filter=lambda p, v: v.ndim >= 2,
-         lr=MATRIX_LR, momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY),
+         lr=MATRIX_LR, momentum=0.95, ns_steps=NS_STEPS, beta2=0.95, weight_decay=WEIGHT_DECAY),
 ])
 
 def loss_fn(model, x, y):
     logits = model(x)
     return mx.mean(nn.losses.cross_entropy(logits, y))
 
-loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+_loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+
+@partial(mx.compile, inputs=[model.state], outputs=[model.state])
+def compiled_loss_and_grad(x, y):
+    return _loss_and_grad_fn(model, x, y)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)
@@ -521,7 +586,7 @@ while True:
     accum_grads = None
     accum_loss = mx.array(0.0)
     for micro_step in range(grad_accum_steps):
-        loss, grads = loss_and_grad_fn(model, x, y)
+        loss, grads = compiled_loss_and_grad(x, y)
         mx.eval(loss, grads)
         accum_loss = accum_loss + loss
         if accum_grads is None:
@@ -537,7 +602,7 @@ while True:
     # Fast fail
     if train_loss_f > 100:
         print("FAIL")
-        exit(1)
+        sys.exit(1)
 
     # Schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -589,10 +654,12 @@ print()
 # Final eval
 # ---------------------------------------------------------------------------
 
-val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+t_eval_start = time.time()
+val_bpb = evaluate_bpb(model, tokenizer, FINAL_EVAL_BATCH_SIZE)
+t_eval_end = time.time()
+print(f"Eval time: {t_eval_end - t_eval_start:.1f}s (batch_size={FINAL_EVAL_BATCH_SIZE})")
 
 t_end = time.time()
-startup_time = t_start_training - t_start
 steady_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_FLOPS if total_training_time > 0 else 0
 peak_mem = mx.get_peak_memory() / 1024 / 1024
 
@@ -606,3 +673,17 @@ print(f"total_tokens_M:   {step * TOTAL_BATCH_SIZE / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"matrix_lr:        {MATRIX_LR}")
+print(f"embedding_lr:     {EMBEDDING_LR}")
+print(f"unembedding_lr:   {UNEMBEDDING_LR}")
+print(f"scalar_lr:        {SCALAR_LR}")
+print(f"weight_decay:     {WEIGHT_DECAY}")
+print(f"warmup_ratio:     {WARMUP_RATIO}")
+print(f"warmdown_ratio:   {WARMDOWN_RATIO}")
+print(f"ns_steps:         {NS_STEPS}")
+print(f"window_pattern:   {WINDOW_PATTERN}")
+print(f"device_batch_size: {DEVICE_BATCH_SIZE}")
+print(f"aspect_ratio:     {ASPECT_RATIO}")
+print(f"adam_beta1:       {ADAM_BETAS[0]}")
+print(f"adam_beta2:       {ADAM_BETAS[1]}")
+print(f"total_batch_size: {TOTAL_BATCH_SIZE}")
